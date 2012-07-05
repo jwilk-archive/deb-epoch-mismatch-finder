@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+
+# Copyright © 2012 Jakub Wilk <jwilk@debian.org>
+
+# Redistribution and use in source and compiled forms, with or without
+# modification, are permitted under any circumstances. No warranty.
+
+import argparse
+import collections
+import dbm
+import functools
+import itertools
+import os
+import subprocess as ipc
+import sys
+
+import apt_pkg
+
+default_snapshot_host = 'stabile.debian.org'
+snapshot_command = (
+    '''psql --cluster 9.0/snapshot service=snapshot-guest -A -t -q -F " " '''
+    '''-c "select name, version from binpkg where version like '%:%'"'''
+)
+
+default_cache_file = os.path.join((
+    os.getenv('XDG_CACHE_HOME') or
+    os.path.join(os.path.expanduser('~'), '.cache')
+), 'debian', 'epoch-validator')
+
+binary_fields = 'Pre-Depends', 'Depends', 'Recommends', 'Suggests', 'Enhances'
+source_fields = 'Build-Depends', 'Build-Depends-Indep'
+
+@functools.total_ordering
+class debian_version(object):
+
+    def __init__(self, value):
+        self.__value = str(value)
+
+    def __lt__(self, other):
+        return apt_pkg.version_compare(self.__value, other.__value) < 0
+
+    def __eq__(self, other):
+        return apt_pkg.version_compare(self.__value, other.__value) == 0
+
+    def __str__(self):
+        return self.__value
+
+    def get_epoch(self):
+        return int(str(self).split(':', 1)[0])
+
+    @staticmethod
+    def minimize(versions):
+        versions = sorted(versions, key=debian_version, reverse=1)
+        first = True
+        for epoch, epoch_versions in itertools.groupby(versions, debian_version.get_epoch):
+            epoch_versions = list(epoch_versions)
+            if first:
+                if len(epoch_versions) != 1:
+                    yield max(epoch_versions)
+                first = False
+            yield min(epoch_versions)
+
+def do_seed(options):
+    version_data = collections.defaultdict(list)
+    if options.user is not None:
+        target = '{user}@{host}'.format(user=options.user, host=options.host)
+    else:
+        target = options.host
+    child = ipc.Popen(
+        ['ssh'] + (options.ssh_arguments or []) + [target, snapshot_command],
+        stdout=ipc.PIPE,
+    )
+    for line in child.stdout:
+        package, version = line.decode('ASCII', 'replace').split()
+        version_data[package] += [version]
+    if child.wait() != 0:
+        raise IOError
+    cache = dbm.open(options.cache, 'c')
+    try:
+        for package, versions in version_data.items():
+            cache[package] = ' '.join(map(str, debian_version.minimize(versions)))
+    finally:
+        cache.close()
+
+def do_dump(options):
+    cache = dbm.open(options.cache)
+    try:
+        for package in sorted(cache.keys()):
+            versions = cache[package].decode('ASCII', 'replace').split()
+            package = package.decode('ASCII', 'replace')
+            for version in versions:
+                print('{package}\t{version}'.format(package=package, version=version))
+    finally:
+        cache.close()
+
+def do_update(options):
+    raise NotImplementedError
+
+def fix_version(current_version, versions):
+    if ':' in current_version:
+        current_epoch, current_bare_version = current_version.split(':', 1)
+        current_epoch = int(current_epoch)
+    else:
+        current_epoch, current_bare_version = 0, current_version
+    max_version = None
+    for version in versions:
+        if max_version is None:
+            max_version = version
+        epoch, bare_version = version.split(':', 1)
+        epoch = int(epoch)
+        if epoch > current_epoch:
+            if debian_version(bare_version) <= debian_version(current_bare_version):
+                new_version = '{epoch}:{bare_version}'.format(epoch=epoch, bare_version=current_bare_version)
+                if debian_version(new_version) <= debian_version(max_version):
+                    return new_version
+    return current_version
+
+def do_check_para(cache, para):
+    package = para['Package']
+    for is_source in False, True:
+        field_list = source_fields if is_source else binary_fields
+        parse_depends = apt_pkg.parse_src_depends if is_source else apt_pkg.parse_depends
+        first = True
+        for field in field_list:
+            first_field = True
+            try:
+                value = para[field]
+            except LookupError:
+                continue
+            for alternative in parse_depends(value):
+                for rel_package, version, relation in alternative:
+                    if relation == '>': relation = '>>'
+                    if relation == '<': relation = '<<'
+                    if not relation.startswith('>'):
+                        continue
+                    try:
+                        versions = cache[rel_package].decode('ASCII', 'replace').split()
+                    except KeyError:
+                        continue
+                    new_version = fix_version(version, versions)
+                    if version == new_version:
+                        continue
+                    if first:
+                        if is_source:
+                            print('Source: {package}'.format(package=package))
+                        else:
+                            print('Package: {package}'.format(package=package))
+                        first = False
+                    if first_field:
+                        print('{field}:'.format(field=field))
+                        first_field=False
+                    print(' {rel_package} ({relation} {version}) ==> {new_version}'.format(**locals()))
+        if not first:
+            print()
+
+def do_check(options):
+    cache = dbm.open(options.cache)
+    try:
+        packages = apt_pkg.TagFile(sys.stdin)
+        for para in packages:
+            do_check_para(cache, para)
+    finally:
+        cache.close()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cache', metavar='<file>',
+        default=default_cache_file,
+        help='use cache file (default: {file})'.format(file=default_cache_file)
+    )
+    subparsers = parser.add_subparsers()
+    p_seed = subparsers.add_parser('seed', help='connect to snapshot.d.o database to seed the version cache')
+    p_seed.set_defaults(action=do_seed)
+    p_seed.add_argument('--host', metavar='<host>',
+        default=default_snapshot_host,
+        help='host to connect to (default: {host})'.format(host=default_snapshot_host)
+    )
+    p_seed.add_argument('--user', metavar='<user>', help='username')
+    p_seed.add_argument('--ssh-arguments', metavar='<arg>', nargs='+', help='extra arguments to pass to ssh')
+    p_dump = subparsers.add_parser('dump', help='dump contents of the version cache (for debugging purposes)')
+    p_dump.set_defaults(action=do_dump)
+    p_update = subparsers.add_parser('update', help='update the version cache')
+    p_update.set_defaults(action=do_update)
+    p_check = subparsers.add_parser('check', help='check packages')
+    p_check.set_defaults(action=do_check)
+    options = parser.parse_args()
+    options.action(options)
+
+def setup():
+    apt_pkg.init_config()
+    apt_pkg.init_system()
+
+if __name__ == '__main__':
+    setup()
+    main()
+
+# vim:ts=4 sw=4 et
