@@ -16,9 +16,9 @@ import sys
 
 import apt_pkg
 
-default_snapshot_host = 'stabile.debian.org'
+default_snapshot_host = 'sibelius.debian.org'
 snapshot_command = (
-    '''psql --cluster 9.0/snapshot service=snapshot-guest -A -t -q -F " " '''
+    '''psql -h localhost -p 5433 -U guest snapshot -A -t -q -F " " '''
     '''-c "select name, version from binpkg where version like '%:%'"'''
 )
 
