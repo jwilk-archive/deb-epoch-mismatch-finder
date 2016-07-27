@@ -148,7 +148,7 @@ def do_check_para(cache, para):
                         first = False
                     if first_field:
                         print('{field}:'.format(field=field))
-                        first_field=False
+                        first_field = False
                     print(' {rel_package} ({relation} {version}) ==> {new_version}'.format(**locals()))
         if not first:
             print()
